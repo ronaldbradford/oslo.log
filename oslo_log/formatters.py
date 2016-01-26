@@ -27,14 +27,6 @@ from oslo_context import context as context_utils
 from oslo_serialization import jsonutils
 
 
-def _dictify_context(context):
-    if context is None:
-        return {}
-    if not isinstance(context, dict) and getattr(context, 'to_dict', None):
-        context = context.to_dict()
-    return context
-
-
 # A configuration object is given to us when the application registers
 # the logging options.
 _CONF = None
@@ -45,7 +37,7 @@ def _store_global_conf(conf):
     _CONF = conf
 
 
-def _update_record_with_context(record):
+def _update_record_with_context(record, conf):
     """Given a log record, update it with context information.
 
     The request context, if there is one, will either be in the
@@ -56,17 +48,13 @@ def _update_record_with_context(record):
         'context',
         context_utils.get_current()
     )
-    d = _dictify_context(context)
-    # Copy the context values directly onto the record so they can be
-    # used by the formatting strings.
-    for k, v in d.items():
-        setattr(record, k, v)
+    if context and isinstance(context, context_utils.RequestContext):
+        # Copy the context values directly onto the record so they can be
+        # used by the formatting strings.
+        for k, v in context.get_logging_values(conf).items():
+            setattr(record, k, v)
+
     return context
-
-
-class _ReplaceFalseValue(dict):
-    def __getitem__(self, key):
-        return dict.get(self, key, None) or '-'
 
 
 class JSONFormatter(logging.Formatter):
@@ -113,7 +101,7 @@ class JSONFormatter(logging.Formatter):
 
         # Build the extra values that were given to us, including
         # the context.
-        context = _update_record_with_context(record)
+        _update_record_with_context(record, self.conf)
         if hasattr(record, 'extra'):
             extra = record.extra.copy()
         else:
@@ -121,11 +109,13 @@ class JSONFormatter(logging.Formatter):
         for key in getattr(record, 'extra_keys', []):
             if key not in extra:
                 extra[key] = getattr(record, key)
+
         # If we saved a context object, explode it into the extra
         # dictionary because the values are more useful than the
         # object reference.
         if 'context' in extra:
-            extra.update(_dictify_context(context))
+            if isinstance(extra['context'], context_utils.RequestContext):
+                extra.update(extra['context'].get_logging_values())
             del extra['context']
         message['extra'] = extra
 
@@ -189,61 +179,7 @@ class ContextFormatter(logging.Formatter):
         record.project = self.project
         record.version = self.version
 
-        # FIXME(dims): We need a better way to pick up the instance
-        # or instance_uuid parameters from the kwargs from say
-        # LOG.info or LOG.warn
-        instance_extra = ''
-        instance = getattr(record, 'instance', None)
-        instance_uuid = getattr(record, 'instance_uuid', None)
-        context = _update_record_with_context(record)
-        if instance:
-            try:
-                instance_extra = (self.conf.instance_format
-                                  % instance)
-            except TypeError:
-                instance_extra = instance
-        elif instance_uuid:
-            instance_extra = (self.conf.instance_uuid_format
-                              % {'uuid': instance_uuid})
-        elif context:
-            # FIXME(dhellmann): We should replace these nova-isms with
-            # more generic handling in the Context class.  See the
-            # app-agnostic-logging-parameters blueprint.
-            instance = getattr(context, 'instance', None)
-            instance_uuid = getattr(context, 'instance_uuid', None)
-
-            # resource_uuid was introduced in oslo_context's
-            # RequestContext
-            resource_uuid = getattr(context, 'resource_uuid', None)
-
-            if instance:
-                instance_extra = (self.conf.instance_format
-                                  % {'uuid': instance})
-            elif instance_uuid:
-                instance_extra = (self.conf.instance_uuid_format
-                                  % {'uuid': instance_uuid})
-            elif resource_uuid:
-                instance_extra = (self.conf.instance_uuid_format
-                                  % {'uuid': resource_uuid})
-
-        record.instance = instance_extra
-
-        # NOTE(sdague): default the fancier formatting params
-        # to an empty string so we don't throw an exception if
-        # they get used
-        for key in ('instance', 'color', 'user_identity', 'resource',
-                    'user_name', 'project_name'):
-            if key not in record.__dict__:
-                record.__dict__[key] = ''
-
-        # Set the "user_identity" value of "logging_context_format_string"
-        # by using "logging_user_identity_format" and
-        # "to_dict()" of oslo.context.
-        if context:
-            record.user_identity = (
-                self.conf.logging_user_identity_format %
-                _ReplaceFalseValue(context.__dict__)
-            )
+        _update_record_with_context(record, self.conf)
 
         if record.__dict__.get('request_id'):
             fmt = self.conf.logging_context_format_string
